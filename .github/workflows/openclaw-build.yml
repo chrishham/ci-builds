@@ -184,7 +184,7 @@ jobs:
             ${{ env.IMAGE }}:${TAG}-amd64 \
             ${{ env.IMAGE }}:${TAG}-arm64
 
-  # --- Cleanup old images (keep last 4 versioned tags) ---
+  # --- Cleanup old images (keep last 12 = ~3 months of weekly builds) ---
   cleanup:
     needs: [retag-upstream, create-manifest]
     if: always() && (needs.retag-upstream.result == 'success' || needs.create-manifest.result == 'success')
@@ -194,13 +194,23 @@ jobs:
 
     steps:
       - name: Delete old image versions
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: openclaw
-          package-type: container
-          min-versions-to-keep: 4
-          delete-only-untagged-versions: false
-          ignore-versions: "^latest$"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # List all versions sorted by creation date (oldest first)
+          VERSIONS=$(gh api --paginate /user/packages/container/openclaw/versions \
+            --jq 'sort_by(.created_at) | reverse | .[].id')
+          COUNT=0
+          for ID in $VERSIONS; do
+            COUNT=$((COUNT + 1))
+            # Skip the 12 newest versions
+            if [ "$COUNT" -le 12 ]; then
+              continue
+            fi
+            echo "Deleting version ID: $ID"
+            gh api -X DELETE /user/packages/container/openclaw/versions/$ID 2>/dev/null || true
+          done
+          echo "Kept $((COUNT < 12 ? COUNT : 12)) versions, deleted $((COUNT > 12 ? COUNT - 12 : 0))"
 
   # --- Deploy ---
   deploy:
