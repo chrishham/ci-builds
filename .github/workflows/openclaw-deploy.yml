@@ -1,0 +1,23 @@
+name: "OpenClaw: Deploy Only"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to deploy (e.g. 2026.3.14-20260316-0600)'
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.OCI_HOST }}
+          username: ubuntu
+          key: ${{ secrets.OCI_SSH_KEY }}
+          script: |
+            kubectl set image deployment/openclaw openclaw=ghcr.io/chrishham/openclaw:${{ github.event.inputs.tag }}
+            kubectl rollout status deployment/openclaw --timeout=120s

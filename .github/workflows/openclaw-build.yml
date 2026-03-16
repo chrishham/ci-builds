@@ -1,0 +1,206 @@
+name: "OpenClaw: Build & Deploy"
+
+on:
+  schedule:
+    # Every Thursday at 06:00 UTC (09:00 Athens time)
+    - cron: '0 6 * * 4'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch of chrishham/openclaw to build from (empty = retag upstream)'
+        required: false
+        default: ''
+      deploy:
+        description: 'Deploy to VPS after build'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/chrishham/openclaw
+
+jobs:
+  # --- Default: retag upstream's official image ---
+  retag-upstream:
+    if: github.event.inputs.branch == '' || github.event.inputs.branch == 'main'
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - name: Sync fork with upstream
+        run: gh repo sync chrishham/openclaw --branch main --source openclaw/openclaw
+        env:
+          GH_TOKEN: ${{ secrets.FORK_PAT }}
+
+      - name: Determine tag
+        id: tag
+        run: |
+          VERSION=$(curl -s https://raw.githubusercontent.com/openclaw/openclaw/main/package.json | jq -r '.version')
+          TIMESTAMP=$(date -u '+%Y%m%d-%H%M')
+          TAG="${VERSION}-${TIMESTAMP}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Retagging upstream ${VERSION} as ${TAG}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Retag upstream image
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }} \
+            -t ${{ env.IMAGE }}:latest \
+            ghcr.io/openclaw/openclaw:latest
+
+  # --- Custom branch: native multi-arch build ---
+  build-amd64:
+    if: github.event.inputs.branch != '' && github.event.inputs.branch != 'main'
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Clone openclaw fork
+        run: git clone --depth 1 --branch "${{ github.event.inputs.branch }}" https://github.com/chrishham/openclaw.git src
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine tag
+        id: tag
+        run: |
+          cd src
+          VERSION=$(jq -r '.version' package.json)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TIMESTAMP=$(date -u '+%Y%m%d-%H%M')
+          echo "tag=${VERSION}-${TIMESTAMP}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push amd64
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./src
+          file: ./src/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}-amd64
+
+  build-arm64:
+    if: github.event.inputs.branch != '' && github.event.inputs.branch != 'main'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Clone openclaw fork
+        run: git clone --depth 1 --branch "${{ github.event.inputs.branch }}" https://github.com/chrishham/openclaw.git src
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine tag
+        id: tag
+        run: |
+          cd src
+          VERSION=$(jq -r '.version' package.json)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TIMESTAMP=$(date -u '+%Y%m%d-%H%M')
+          echo "tag=${VERSION}-${TIMESTAMP}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push arm64
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./src
+          file: ./src/Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}-arm64
+
+  create-manifest:
+    needs: [build-amd64, build-arm64]
+    if: github.event.inputs.branch != '' && github.event.inputs.branch != 'main'
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - name: Clone openclaw fork
+        run: git clone --depth 1 --branch "${{ github.event.inputs.branch }}" https://github.com/chrishham/openclaw.git src
+
+      - name: Determine tag
+        id: tag
+        run: |
+          cd src
+          VERSION=$(jq -r '.version' package.json)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TIMESTAMP=$(date -u '+%Y%m%d-%H%M')
+          echo "tag=${VERSION}-${TIMESTAMP}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE }}:${TAG} \
+            ${{ env.IMAGE }}:${TAG}-amd64 \
+            ${{ env.IMAGE }}:${TAG}-arm64
+
+  # --- Deploy ---
+  deploy:
+    needs: [retag-upstream, create-manifest]
+    if: |
+      always() &&
+      (github.event.inputs.deploy != 'false') &&
+      (needs.retag-upstream.result == 'success' || needs.create-manifest.result == 'success')
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.OCI_HOST }}
+          username: ubuntu
+          key: ${{ secrets.OCI_SSH_KEY }}
+          script: |
+            TAG="${{ needs.retag-upstream.outputs.tag || needs.create-manifest.outputs.tag }}"
+            kubectl set image deployment/openclaw openclaw=ghcr.io/chrishham/openclaw:${TAG}
+            kubectl rollout status deployment/openclaw --timeout=120s
