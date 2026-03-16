@@ -184,6 +184,24 @@ jobs:
             ${{ env.IMAGE }}:${TAG}-amd64 \
             ${{ env.IMAGE }}:${TAG}-arm64
 
+  # --- Cleanup old images (keep last 4 versioned tags) ---
+  cleanup:
+    needs: [retag-upstream, create-manifest]
+    if: always() && (needs.retag-upstream.result == 'success' || needs.create-manifest.result == 'success')
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+
+    steps:
+      - name: Delete old image versions
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: openclaw
+          package-type: container
+          min-versions-to-keep: 4
+          delete-only-untagged-versions: false
+          ignore-versions: "^latest$"
+
   # --- Deploy ---
   deploy:
     needs: [retag-upstream, create-manifest]
