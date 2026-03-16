@@ -62,14 +62,31 @@ jobs:
             -t ${{ env.IMAGE }}:latest \
             ghcr.io/openclaw/openclaw:latest
 
-  # --- Custom branch: native multi-arch build ---
-  build-amd64:
+  # --- Custom branch: compute tag once, then build per-arch ---
+  prepare-custom:
     if: github.event.inputs.branch != '' && github.event.inputs.branch != 'main'
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - name: Clone and compute tag
+        id: tag
+        run: |
+          git clone --depth 1 --branch "${{ github.event.inputs.branch }}" https://github.com/chrishham/openclaw.git src
+          cd src
+          VERSION=$(jq -r '.version' package.json)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TIMESTAMP=$(date -u '+%Y%m%d-%H%M')
+          TAG="${VERSION}-${TIMESTAMP}-${SHORT_SHA}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Building ${TAG} from branch ${{ github.event.inputs.branch }}"
+
+  build-amd64:
+    needs: prepare-custom
     runs-on: ubuntu-24.04
     permissions:
       packages: write
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - name: Clone openclaw fork
@@ -85,17 +102,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determine tag
-        id: tag
-        run: |
-          cd src
-          VERSION=$(jq -r '.version' package.json)
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          TIMESTAMP=$(date -u '+%Y%m%d-%H%M')
-          echo "tag=${VERSION}-${TIMESTAMP}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-
       - name: Build and push amd64
-        id: build
         uses: docker/build-push-action@v6
         with:
           context: ./src
@@ -103,15 +110,13 @@ jobs:
           platforms: linux/amd64
           push: true
           provenance: false
-          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}-amd64
+          tags: ${{ env.IMAGE }}:${{ needs.prepare-custom.outputs.tag }}-amd64
 
   build-arm64:
-    if: github.event.inputs.branch != '' && github.event.inputs.branch != 'main'
+    needs: prepare-custom
     runs-on: ubuntu-24.04-arm
     permissions:
       packages: write
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - name: Clone openclaw fork
@@ -127,17 +132,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determine tag
-        id: tag
-        run: |
-          cd src
-          VERSION=$(jq -r '.version' package.json)
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          TIMESTAMP=$(date -u '+%Y%m%d-%H%M')
-          echo "tag=${VERSION}-${TIMESTAMP}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-
       - name: Build and push arm64
-        id: build
         uses: docker/build-push-action@v6
         with:
           context: ./src
@@ -145,30 +140,17 @@ jobs:
           platforms: linux/arm64
           push: true
           provenance: false
-          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}-arm64
+          tags: ${{ env.IMAGE }}:${{ needs.prepare-custom.outputs.tag }}-arm64
 
   create-manifest:
-    needs: [build-amd64, build-arm64]
-    if: github.event.inputs.branch != '' && github.event.inputs.branch != 'main'
+    needs: [prepare-custom, build-amd64, build-arm64]
     runs-on: ubuntu-24.04
     permissions:
       packages: write
     outputs:
-      tag: ${{ steps.tag.outputs.tag }}
+      tag: ${{ needs.prepare-custom.outputs.tag }}
 
     steps:
-      - name: Clone openclaw fork
-        run: git clone --depth 1 --branch "${{ github.event.inputs.branch }}" https://github.com/chrishham/openclaw.git src
-
-      - name: Determine tag
-        id: tag
-        run: |
-          cd src
-          VERSION=$(jq -r '.version' package.json)
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          TIMESTAMP=$(date -u '+%Y%m%d-%H%M')
-          echo "tag=${VERSION}-${TIMESTAMP}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -178,13 +160,13 @@ jobs:
 
       - name: Create multi-arch manifest
         run: |
-          TAG="${{ steps.tag.outputs.tag }}"
+          TAG="${{ needs.prepare-custom.outputs.tag }}"
           docker buildx imagetools create \
             -t ${{ env.IMAGE }}:${TAG} \
             ${{ env.IMAGE }}:${TAG}-amd64 \
             ${{ env.IMAGE }}:${TAG}-arm64
 
-  # --- Cleanup old images (keep last 12 = ~3 months of weekly builds) ---
+  # --- Cleanup old images (keep last 30) ---
   cleanup:
     needs: [retag-upstream, create-manifest]
     if: always() && (needs.retag-upstream.result == 'success' || needs.create-manifest.result == 'success')
@@ -197,20 +179,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # List all versions sorted by creation date (oldest first)
           VERSIONS=$(gh api --paginate /user/packages/container/openclaw/versions \
             --jq 'sort_by(.created_at) | reverse | .[].id')
           COUNT=0
+          DELETED=0
           for ID in $VERSIONS; do
             COUNT=$((COUNT + 1))
-            # Skip the 12 newest versions
-            if [ "$COUNT" -le 12 ]; then
+            if [ "$COUNT" -le 30 ]; then
               continue
             fi
             echo "Deleting version ID: $ID"
             gh api -X DELETE /user/packages/container/openclaw/versions/$ID 2>/dev/null || true
+            DELETED=$((DELETED + 1))
           done
-          echo "Kept $((COUNT < 12 ? COUNT : 12)) versions, deleted $((COUNT > 12 ? COUNT - 12 : 0))"
+          echo "Kept $((COUNT < 30 ? COUNT : 30)) versions, deleted ${DELETED}"
 
   # --- Deploy ---
   deploy:
